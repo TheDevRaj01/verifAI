@@ -121,7 +121,7 @@ Scrutiny officers face severe bottlenecks and security vulnerabilities:
 ## Project Directory & File Structure
 
 ```
-SIH 26261 a/
+verifAI/
 ├── index.html                      # HTML5 entrypoint with Google Fonts and meta tags
 ├── package.json                    # Project dependencies and script definitions
 ├── tsconfig.json                   # TypeScript compiler configuration
@@ -130,7 +130,6 @@ SIH 26261 a/
 ├── postcss.config.js               # PostCSS plugin pipeline
 ├── firestore.rules                 # Production Firestore security and RBAC rules
 ├── storage.rules                   # Production Cloud Storage security rules
-├── .env.example                    # Template for Firebase and environment variables
 │
 ├── src/
 │   ├── main.tsx                    # React application bootstrap root
