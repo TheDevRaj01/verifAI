@@ -1,0 +1,131 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==========================================
+    // Security Helper Functions
+    // ==========================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'admin' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'admin') ||
+        request.auth.token.email in ['admin@aicte.gov.in', 'scrutiny@aicte-india.org', 'director.approval@aicte.gov.in']
+      );
+    }
+
+    function isCollegeUser() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'college' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'college')
+      );
+    }
+
+    function getCollegeId() {
+      return request.auth.token.collegeId != null 
+        ? request.auth.token.collegeId 
+        : (exists(/databases/$(database)/documents/users/$(request.auth.uid)) ? getUserData().collegeId : null);
+    }
+
+    // ==========================================
+    // 1. User Profiles (/users)
+    // ==========================================
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      // Prevent privilege escalation: non-admin cannot self-assign role = 'admin'
+      allow create: if isAuthenticated() && request.auth.uid == userId && (
+        request.resource.data.role != 'admin' || isAdmin()
+      );
+      allow update: if isAuthenticated() && (
+        isAdmin() || (
+          request.auth.uid == userId &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.uid == resource.data.uid
+        )
+      );
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 2. Colleges Collection (/colleges)
+    // ==========================================
+    match /colleges/{collegeId} {
+      // Public directory read of registered institutions
+      allow read: if true;
+      // Only AICTE Central Administrators can create, approve, or update institution accounts
+      allow write: if isAdmin();
+    }
+
+    // ==========================================
+    // 3. Applications Collection (/applications)
+    // ==========================================
+    match /applications/{applicationId} {
+      // AICTE Admins can inspect all applications
+      // Colleges can only read applications that belong to their own College ID
+      allow read: if isAdmin() || (
+        isCollegeUser() && resource.data.collegeId == getCollegeId()
+      );
+
+      // Authenticated colleges can create new applications for their own institution
+      allow create: if isAdmin() || (
+        isCollegeUser() &&
+        request.resource.data.collegeId == getCollegeId() &&
+        request.resource.data.status in ['Draft', 'Submitted']
+      );
+
+      // Colleges can update their own drafts; Admins can update any application status
+      allow update: if isAdmin() || (
+        isCollegeUser() &&
+        resource.data.collegeId == getCollegeId() &&
+        request.resource.data.collegeId == resource.data.collegeId
+      );
+
+      // Applications cannot be deleted by colleges; only Admins can purge
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 4. Unique ID Requests (/idRequests)
+    // ==========================================
+    match /idRequests/{requestId} {
+      // Unauthenticated or new applicant colleges can submit an onboarding request
+      // Must be created in 'Pending' status with required college name and email
+      allow create: if request.resource.data.status == 'Pending' &&
+                       request.resource.data.collegeName is string &&
+                       request.resource.data.officialEmail is string;
+
+      // Only AICTE Admins can view the request queue
+      allow read: if isAdmin();
+
+      // Only AICTE Admins can approve (assign ID) or reject requests
+      allow update: if isAdmin() && (
+        request.resource.data.status in ['Approved', 'Rejected']
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 5. Document Checklist Requirements (/checklists)
+    // ==========================================
+    match /checklists/{requirementId} {
+      // Colleges can only read active requirements; Admins can read all requirements
+      allow read: if isAdmin() || (
+        isAuthenticated() && resource.data.isActive == true
+      );
+
+      // Only AICTE Central Administrators can create, update, reorder, or delete checklist rules
+      allow write: if isAdmin();
+    }
+  }
+}
+

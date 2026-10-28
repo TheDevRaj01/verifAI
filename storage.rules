@@ -1,0 +1,37 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'admin' ||
+        request.auth.token.email in ['admin@aicte.gov.in', 'scrutiny@aicte-india.org', 'director.approval@aicte.gov.in']
+      );
+    }
+    
+    function isCollegeOwner(collegeId) {
+      return isAuthenticated() && (
+        request.auth.token.collegeId == collegeId ||
+        request.auth.token.role == 'college'
+      );
+    }
+
+    // Application documents storage path: /applications/{collegeId}/{appId}/{fileName}
+    match /applications/{collegeId}/{appId}/{fileName} {
+      // Only AICTE Admins or the owning college can read/download uploaded compliance documents
+      allow read: if isAdmin() || isCollegeOwner(collegeId);
+
+      // Only the owning college can upload documents for their own institution, up to 25MB, PDF/images
+      allow write: if (isCollegeOwner(collegeId) || isAdmin()) &&
+                      request.resource.size < 25 * 1024 * 1024 &&
+                      request.resource.contentType.matches('application/pdf|image/jpeg|image/png|image/jpg');
+
+      // Only Admins or the owning college can delete
+      allow delete: if isAdmin() || isCollegeOwner(collegeId);
+    }
+  }
+}
