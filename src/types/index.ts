@@ -118,6 +118,9 @@ export interface DocumentVersionSnapshot {
   fileType?: string;
   uploadDate?: string;
   fileDataUrl?: string;
+  fileUrl?: string;
+  storagePath?: string;
+  fileBlobId?: string;
   fileHash?: string;
   extractedText?: string;
   ocrResult?: DocumentOcrResult;
@@ -305,6 +308,9 @@ export interface RequiredDocument {
   fileType?: string;
   uploadDate?: string;
   fileDataUrl?: string;
+  fileUrl?: string;
+  storagePath?: string;
+  fileBlobId?: string;
   adminRemarks?: string;
   reviewedBy?: string;
   reviewedAt?: string;
@@ -363,6 +369,9 @@ export interface InfrastructureEvidenceItem {
   fileSize?: string;
   fileType: string;
   fileDataUrl?: string;
+  fileUrl?: string;
+  storagePath?: string;
+  fileBlobId?: string;
   evidenceCategory: InfrastructureEvidenceType;
   uploadDate: string;
   uploadedBy?: string;
@@ -472,7 +481,8 @@ export interface ApplicationAuditLog {
     | 'AUTHORITY_VERIFICATION_STARTED'
     | 'AUTHORITY_VERIFICATION_COMPLETED'
     | 'AUTHORITY_VERIFICATION_FAILED'
-    | 'AUTHORITY_MANUAL_REVIEW_RECORDED';
+    | 'AUTHORITY_MANUAL_REVIEW_RECORDED'
+    | 'STORAGE_MIGRATION';
   actor: string;
   actorRole: UserRole;
   details: string;

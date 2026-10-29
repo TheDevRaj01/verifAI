@@ -44,7 +44,11 @@ export async function calculateFileHash(
 ): Promise<string> {
   let uint8: Uint8Array;
   if (typeof data === 'string') {
-    if (data.startsWith('data:') || data.length > 200) {
+    if (data.startsWith('http://') || data.startsWith('https://')) {
+      const response = await fetch(data);
+      const buffer = await response.arrayBuffer();
+      uint8 = new Uint8Array(buffer);
+    } else if (data.startsWith('data:') || data.length > 200) {
       uint8 = dataUrlToUint8Array(data);
     } else {
       uint8 = new TextEncoder().encode(data);

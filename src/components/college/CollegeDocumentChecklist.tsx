@@ -170,6 +170,17 @@ export const CollegeDocumentChecklist: React.FC<Props> = ({
       return;
     }
 
+    // Spark Free Plan 500 KiB limit for PDFs
+    const isImageFile = /\.(jpe?g|png|webp)$/i.test(fileName);
+    if (!isImageFile && file.size > 512000) {
+      showNotice(
+        'error',
+        `File "${fileName}" (${(file.size / 1024).toFixed(0)} KB) exceeds the Spark Free Tier limit of 500 KB per document. Please compress your PDF before uploading.`
+      );
+      e.target.value = '';
+      return;
+    }
+
     // 2. Validate File Extension
     const ext = '.' + fileName.split('.').pop()?.toLowerCase();
     const isAllowed = req.allowedFileTypes.some((t) => t.toLowerCase() === ext);

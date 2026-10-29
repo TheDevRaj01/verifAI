@@ -10,13 +10,13 @@
 2. [Key Features & System Capabilities](#key-features--system-capabilities)
 3. [Technology Stack](#technology-stack)
 4. [Project Directory & File Structure](#project-directory--file-structure)
-5. [Prerequisites & System Requirements](#prerequisites--system-requirements)
+5. [Prerequisites & System Requirements (`req.txt`)](#prerequisites--system-requirements-reqtxt)
 6. [Setup & Installation](#setup--installation)
 7. [Operating Modes](#operating-modes)
    - [Local Simulation Mode (Default)](#local-simulation-mode-default)
-   - [Live Firebase Mode](#live-firebase-mode)
+   - [Live Firebase Mode (Spark Free Plan Architecture)](#live-firebase-mode-spark-free-plan-architecture)
 8. [Demo Credentials & Sample Dossiers](#demo-credentials--sample-dossiers)
-9. [Automated Test Suite](#automated-test-suite)
+9. [Automated Test Suite (128 Tests)](#automated-test-suite-128-tests)
 10. [Core Safeguards & Compliance Rules](#core-safeguards--compliance-rules)
 11. [License & Acknowledgments](#license--acknowledgments)
 
@@ -112,9 +112,9 @@ Scrutiny officers face severe bottlenecks and security vulnerabilities:
 | **Frontend Framework** | React 18.3, TypeScript 5.6, Vite 5.4 |
 | **Styling & UI Components** | Tailwind CSS 3.4, PostCSS, Autoprefixer, Lucide React (Icons) |
 | **Client-Side Document AI** | PDF.js (`pdfjs-dist` v6.4), Tesseract OCR (`tesseract.js` v7.0) |
-| **Storage & Persistence** | Dual-mode: Browser `localStorage` (Simulation) / Firebase Cloud Firestore |
+| **Storage & Persistence** | Dual-mode: Browser `localStorage` (Simulation) / Firebase Cloud Firestore (Spark Free Plan binary subcollections) |
 | **Authentication** | Dual-mode: In-memory session simulation / Firebase Authentication |
-| **Testing & Quality Assurance** | Node.js Test Runner (`--test --experimental-strip-types`) |
+| **Testing & Quality Assurance** | Node.js Test Runner (`--test --experimental-strip-types`) — 128 tests across 8 suites |
 
 ---
 
@@ -124,12 +124,17 @@ Scrutiny officers face severe bottlenecks and security vulnerabilities:
 verifAI/
 ├── index.html                      # HTML5 entrypoint with Google Fonts and meta tags
 ├── package.json                    # Project dependencies and script definitions
+├── req.txt                         # Formal system, dependency, hardware, and environment specifications
+├── requirements.txt                # Python virtual environment dependencies (pypdf, OCR, backend utilities)
 ├── tsconfig.json                   # TypeScript compiler configuration
 ├── vite.config.ts                  # Vite bundler build and plugin configuration
 ├── tailwind.config.js              # Tailwind CSS utility theme configuration
 ├── postcss.config.js               # PostCSS plugin pipeline
-├── firestore.rules                 # Production Firestore security and RBAC rules
-├── storage.rules                   # Production Cloud Storage security rules
+├── firestore.rules                 # Production Firestore security and RBAC rules (Spark Free compatible)
+├── storage.rules                   # Storage security rules (optional reference)
+│
+├── scripts/
+│   └── provisionDemoAccounts.js    # Automated provisioning of AICTE Admin and College accounts in Firebase
 │
 ├── src/
 │   ├── main.tsx                    # React application bootstrap root
@@ -148,7 +153,7 @@ verifAI/
 │   │
 │   ├── services/
 │   │   ├── authService.ts          # Authentication abstraction (Admin & College RBAC)
-│   │   ├── dataService.ts          # Core persistence engine (applications, documents, audit logs)
+│   │   ├── dataService.ts          # Core persistence engine (subcollection blobs, metadata, rollback)
 │   │   ├── ocrService.ts           # PDF.js and Tesseract.js client-side OCR extraction
 │   │   ├── documentValidationService.ts # Document intelligence, dates, UDINs, and anomaly checks
 │   │   ├── duplicateDetectionService.ts  # File hashing, info matching, and OCR Jaccard similarity
@@ -192,17 +197,31 @@ verifAI/
     ├── duplicateDetection.test.ts          # 10 tests: File hash, certificate match, and OCR similarity
     ├── documentAnomalies.test.ts           # 21 tests: PDF forensics, timestamp anomalies, and tampering
     ├── regulatoryCompliance.test.ts        # 28 tests: AICTE infrastructure compliance and visual evidence
-    └── issuingAuthorityVerification.test.ts# 25 tests: Authority verification, guided manual review, and RBAC
+    ├── issuingAuthorityVerification.test.ts# 25 tests: Authority verification, guided manual review, and RBAC
+    ├── cloudStorageSync.test.ts            # 10 tests: Cloud storage sync contracts, isolation, and rollback
+    └── sparkFirestoreSync.test.ts          # 10 tests: 500 KB limits, blob decoupling, and Spark safety
 ```
 
 ---
 
-## Prerequisites & System Requirements
+## Prerequisites & System Requirements (`req.txt` & `requirements.txt`)
 
-- **Operating System:** macOS, Linux, or Windows (WSL recommended)
+All system requirements, dependencies, and environment variables are documented in [`req.txt`](file:///Users/devraj/Downloads/SIH%2026261/SIH%2026261%20a/req.txt):
+
+- **Operating System:** macOS, Linux, or Windows (WSL2 recommended)
 - **Node.js:** v18.0.0 or higher (v20+ recommended for `--experimental-strip-types`)
 - **Package Manager:** `npm` v9.0.0 or higher
-- **Web Browser:** Modern Chromium-based browser (Chrome, Edge, Brave), Firefox, or Safari (supporting Canvas and Web Workers for OCR).
+- **Web Browser:** Modern Chromium-based browser (Chrome, Edge, Brave), Firefox, or Safari (supporting HTML5 Canvas and Web Workers for client-side OCR and photo compression)
+- **Hardware Resources:** Min 4 GB RAM (8 GB recommended for in-browser OCR processing), min 500 MB free disk space
+
+### Optional Python Virtual Environment (`requirements.txt`)
+If you require a Python virtual environment for backend forensic utilities, PDF extraction, or microservices:
+```bash
+python3 -m venv venv
+source venv/bin/activate       # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+This installs `pypdf`, `pdfplumber`, `pytesseract`, `pillow`, `fastapi`, `uvicorn`, and `firebase-admin`.
 
 ---
 
@@ -246,49 +265,59 @@ VerifAI automatically detects its environment and switches seamlessly between tw
 - Pre-seeded with 5 realistic AICTE institutions across Delhi, Maharashtra, Karnataka, Tamil Nadu, and Uttar Pradesh.
 - Allows complete demonstration of all features: OCR, document validation, forensic checks, duplicate detection, infrastructure evidence, and guided manual authority verification.
 
-### Live Firebase Mode
-To connect the application to your live Firebase Cloud environment:
+### Live Firebase Mode (Spark Free Plan Architecture)
+
+VerifAI operates seamlessly on the **Firebase Spark Free Tier (Zero Billing Required)**:
+- **No Cloud Storage or Blaze Upgrade Needed:** Binary documents and photos are decoupled from application metadata and stored inside dedicated Firestore subcollections (`applications/{appId}/fileBlobs/{fileId}`).
+- **Lightweight Metadata:** Main application records remain strictly under 25 KB.
+- **Safety Headroom:** A strict 500 KiB limit is enforced for PDFs, and high-resolution camera photos are auto-compressed via HTML5 Canvas (~180–380 KB).
+- **Two-Phase Upload & Rollback:** Subcollection blobs are automatically cleaned up if application metadata persistence fails.
+
+#### Setup Steps for Live Cloud Mode:
 1. Create a Firebase project at the [Firebase Console](https://console.firebase.google.com/).
-2. Enable **Authentication** (Email/Password provider).
-3. Enable **Cloud Firestore** and deploy `firestore.rules`.
-4. Enable **Cloud Storage** and deploy `storage.rules`.
-5. Copy your Firebase web credentials into a `.env` file in the root directory:
+2. Enable **Authentication** $\rightarrow$ **Sign-in method** $\rightarrow$ enable **Email/Password**.
+3. Create a **Cloud Firestore** database.
+4. Go to **Firestore Database** $\rightarrow$ **Rules** tab, paste the contents of [`firestore.rules`](file:///Users/devraj/Downloads/SIH%2026261/SIH%2026261%20a/firestore.rules), and click **Publish**.
+5. Copy your Firebase web credentials into `.env`:
    ```env
    VITE_FIREBASE_API_KEY=your_api_key_here
    VITE_FIREBASE_AUTH_DOMAIN=your-project.firebaseapp.com
    VITE_FIREBASE_PROJECT_ID=your-project-id
-   VITE_FIREBASE_STORAGE_BUCKET=your-project.appspot.com
    VITE_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
    VITE_FIREBASE_APP_ID=your_app_id
    ```
-6. Restart the development server (`npm run dev`). VerifAI will automatically detect the configuration and connect to Firebase.
+6. Provision the evaluation accounts into your Firebase project:
+   ```bash
+   node scripts/provisionDemoAccounts.js
+   ```
+7. Start the dev server (`npm run dev`) or deploy to Vercel.
 
 ---
 
 ## Demo Credentials & Sample Dossiers
 
-The platform includes convenient one-click demo fill buttons on all login modals.
+The platform includes convenient one-click demo fill buttons on all login modals and pre-provisioned live Firebase accounts:
 
-### 1. AICTE Scrutiny Officer (Admin)
-- **Email:** `admin@aicte.gov.in`
-- **Password:** `Admin@AICTE2026!`
-- **Role:** Central Scrutiny Officer
-- **Capabilities:** Review all applications, inspect forensic metadata, trigger authority verification, record guided manual reviews, approve unique IDs, and configure checklists.
-
-### 2. College Institutional Accounts
-| Institution Name | AICTE Unique ID | Password | Stream |
+### 1. AICTE Scrutiny Officers (Admin Portal)
+| Email | Password | Role / Title | Scope |
 | :--- | :--- | :--- | :--- |
-| **Delhi Institute of Engineering & Advanced Technology** | `1-10972341` | `Password@123` | Engineering (EoA) |
-| **Maharashtra Institute of Technical Sciences** | `1-24891102` | `Password@123` | Engineering (New Approval) |
-| **Karnataka Apex Academy of Management & Technology** | `1-38290145` | `Password@123` | Management (EoA) |
-| **Tamil Nadu College of Architecture & Planning** | `1-49012389` | `Password@123` | Architecture (New Approval) |
-| **Aryavart Institute of Pharmaceutical Studies** | `1-51289033` | `Password@123` | Pharmacy (EoA) |
+| `admin@aicte.gov.in` | `Admin@AICTE2026!` | Central Scrutiny Officer | Full scrutiny, compliance audit, authority verification |
+| `scrutiny@aicte-india.org` | `Admin@AICTE2026!` | Scrutiny Directorate | Multi-officer reviews & deficiency reporting |
+
+### 2. College Institutional Accounts (College Portal)
+| Institution Name | AICTE Unique ID | Official Email | Password | Stream |
+| :--- | :--- | :--- | :--- | :--- |
+| **Delhi Institute of Engineering & Technology** | `1-10972341` | `principal@delhitechnical.edu.in` | `Password@123` | Engineering (EoA) |
+| **Maharashtra Polytechnic & Technology Academy** | `1-24891102` | `director@mumbaipolytechnic.edu.in` | `Password@123` | Engineering (New Approval) |
+| **Bengaluru Technical Institute** | `1-38290145` | `info@karnatakatech.ac.in` | `Password@123` | Management (EoA) |
+| **Bengal Institute of Pharmaceutical Sciences** | `1-49012389` | `registrar@bengalpharmacy.edu.in` | `Password@123` | Pharmacy (EoA) |
+| **Tamil Nadu College of Architecture & Planning** | `1-51289033` | `principal@tnengineering.edu.in` | `Password@123` | Architecture (New Approval) |
 
 ---
 
-## Automated Test Suite
+## Automated Test Suite (133 Tests)
 
-VerifAI contains a comprehensive automated test suite consisting of **108 tests** covering all domain services, verification logic, and security rules.
+VerifAI contains a comprehensive automated test suite consisting of **133 tests** covering all domain services, verification logic, cross-device synchronization, and security rules.
 
 ### Running All Tests
 ```bash
@@ -304,7 +333,9 @@ npm test
 | `tests/documentAnomalies.test.ts` | 21 | PDF creation timestamp anomalies, software producer tampering indicators, and metadata validation. |
 | `tests/regulatoryCompliance.test.ts` | 28 | AICTE infrastructure rules (land, built-up area, classrooms, labs), photo evidence reviews, and track separation. |
 | `tests/issuingAuthorityVerification.test.ts` | 25 | Issuing authority registries, QR domain whitelisting, digital signatures, guided manual workflow, and RBAC. |
-| **Total Tests** | **108** | **100% Pass Rate (0 failures)** |
+| `tests/cloudStorageSync.test.ts` | 10 | Storage contracts, cross-device download, institutional isolation, and rollback error handling. |
+| `tests/sparkFirestoreSync.test.ts` | 15 | Spark 500 KB limit, Firestore subcollection blobs, dual-storage resilience, hybrid local-cloud merge, and Admin portal upload visibility. |
+| **Total Tests** | **133** | **100% Pass Rate (0 failures)** |
 
 ### Static Type Checking
 ```bash

@@ -679,6 +679,26 @@ export function extractPdfMetadataSync(fileDataUrl?: string): PdfDocumentMetadat
  * Async wrapper for PDF metadata extraction.
  */
 export async function extractPdfMetadata(fileDataUrl?: string): Promise<PdfDocumentMetadata | undefined> {
+  if (!fileDataUrl) return undefined;
+  if (fileDataUrl.startsWith('http://') || fileDataUrl.startsWith('https://')) {
+    try {
+      const response = await fetch(fileDataUrl);
+      if (!response.ok) return undefined;
+      const buffer = await response.arrayBuffer();
+      const uint8 = new Uint8Array(buffer);
+      let binaryString = '';
+      const len = uint8.length;
+      const headLen = Math.min(len, 8192);
+      for (let i = 0; i < headLen; i++) binaryString += String.fromCharCode(uint8[i]);
+      if (len > 8192) {
+        const tailStart = Math.max(headLen, len - 8192);
+        for (let j = tailStart; j < len; j++) binaryString += String.fromCharCode(uint8[j]);
+      }
+      return extractPdfMetadataSync(binaryString);
+    } catch {
+      return undefined;
+    }
+  }
   return extractPdfMetadataSync(fileDataUrl);
 }
 

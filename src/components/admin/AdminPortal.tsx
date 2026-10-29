@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { CollegeApplication, UniqueIdRequest, ApplicationType } from '../../types';
-import { getApplications, getIdRequests } from '../../services/dataService';
+import { getApplications, getIdRequests, getApplicationById } from '../../services/dataService';
+import { db, isFirebaseConfigured } from '../../services/firebase';
+import { collection, onSnapshot } from 'firebase/firestore';
 import { AdminLoginModal } from './AdminLoginModal';
 import { ApplicationDetailModal } from './ApplicationDetailModal';
 import { IdRequestsSection } from './IdRequestsSection';
@@ -24,7 +26,8 @@ import {
   Award,
   Layers,
   ShieldAlert,
-  LogOut
+  LogOut,
+  RefreshCw
 } from 'lucide-react';
 
 export const AdminPortal: React.FC = () => {
@@ -37,10 +40,46 @@ export const AdminPortal: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedApp, setSelectedApp] = useState<CollegeApplication | null>(null);
+  const [lastSynced, setLastSynced] = useState<string>(new Date().toLocaleTimeString());
 
   useEffect(() => {
-    if (isAdmin) {
-      loadData();
+    if (!isAdmin) return;
+    loadData();
+
+    // Real-time Firestore sync: updates instantly when a college uploads documents or status changes
+    if (isFirebaseConfigured && db) {
+      try {
+        const unsubApps = onSnapshot(
+          collection(db, 'applications'),
+          (snapshot) => {
+            const apps = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as CollegeApplication));
+            if (apps.length > 0) {
+              setApplications(apps);
+              setLastSynced(new Date().toLocaleTimeString());
+            }
+          },
+          (err) => console.warn('[VerifAI] Admin live applications snapshot notice:', err)
+        );
+
+        const unsubReqs = onSnapshot(
+          collection(db, 'idRequests'),
+          (snapshot) => {
+            const reqs = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as UniqueIdRequest));
+            if (reqs.length > 0) {
+              setIdRequests(reqs);
+              setLastSynced(new Date().toLocaleTimeString());
+            }
+          },
+          (err) => console.warn('[VerifAI] Admin live idRequests snapshot notice:', err)
+        );
+
+        return () => {
+          unsubApps();
+          unsubReqs();
+        };
+      } catch (subErr) {
+        console.warn('[VerifAI] Live sync setup notice:', subErr);
+      }
     }
   }, [isAdmin]);
 
@@ -50,10 +89,20 @@ export const AdminPortal: React.FC = () => {
       const [apps, reqs] = await Promise.all([getApplications(), getIdRequests()]);
       setApplications(apps);
       setIdRequests(reqs);
+      setLastSynced(new Date().toLocaleTimeString());
     } catch (e) {
       console.warn('Error loading admin portal data:', e);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleOpenApp = async (app: CollegeApplication) => {
+    try {
+      const fresh = await getApplicationById(app.id, true);
+      setSelectedApp(fresh || app);
+    } catch {
+      setSelectedApp(app);
     }
   };
 
@@ -307,19 +356,37 @@ export const AdminPortal: React.FC = () => {
           </button>
         </div>
 
-        {/* Search input */}
-        {activeTab !== 'id_requests' && activeTab !== 'checklists' && (
-          <div className="relative min-w-[260px]">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
-            <input
-              type="text"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Filter by college, ID, or state..."
-              className="w-full pl-9 pr-3 py-1.5 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-            />
+        {/* Search input & Live Sync Controls */}
+        <div className="flex items-center gap-3">
+          {activeTab !== 'id_requests' && activeTab !== 'checklists' && (
+            <div className="relative min-w-[220px] sm:min-w-[260px]">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+              <input
+                type="text"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                placeholder="Filter by college, ID, or state..."
+                className="w-full pl-9 pr-3 py-1.5 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
+              />
+            </div>
+          )}
+
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <div className="hidden sm:flex items-center gap-1.5 text-[11px] text-slate-500 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-lg">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span>Live Sync: <strong>{lastSynced}</strong></span>
+            </div>
+            <button
+              onClick={() => loadData()}
+              disabled={loading}
+              className="p-1.5 text-slate-600 hover:text-blue-800 hover:bg-slate-100 rounded-lg border border-slate-300 transition-all flex items-center gap-1 text-xs font-semibold"
+              title="Refresh records from Cloud Firestore"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-blue-700' : ''}`} />
+              <span className="hidden md:inline">Refresh</span>
+            </button>
           </div>
-        )}
+        </div>
       </div>
 
       {/* SECTION 1: EoA Applications Table */}
@@ -406,7 +473,7 @@ export const AdminPortal: React.FC = () => {
 
                     <td className="py-3.5 px-4 text-right">
                       <button
-                        onClick={() => setSelectedApp(app)}
+                        onClick={() => handleOpenApp(app)}
                         className="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 rounded-lg text-xs font-bold transition-colors inline-flex items-center gap-1"
                       >
                         <Eye className="w-3.5 h-3.5" />
@@ -497,7 +564,7 @@ export const AdminPortal: React.FC = () => {
 
                     <td className="py-3.5 px-4 text-right">
                       <button
-                        onClick={() => setSelectedApp(app)}
+                        onClick={() => handleOpenApp(app)}
                         className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 rounded-lg text-xs font-bold transition-colors inline-flex items-center gap-1"
                       >
                         <Eye className="w-3.5 h-3.5" />

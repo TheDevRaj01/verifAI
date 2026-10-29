@@ -11,7 +11,11 @@ import {
   getChecklistRequirements,
   reviewApplicationDocument,
   updateApplicationStatus,
+  getApplicationById,
+  getApplicationFileBlob,
 } from '../../services/dataService';
+import { db, isFirebaseConfigured } from '../../services/firebase';
+import { collection, query, where, onSnapshot } from 'firebase/firestore';
 import { ChecklistManagementSection } from './ChecklistManagementSection';
 import {
   Building2,
@@ -40,6 +44,7 @@ import {
   Copy,
 } from 'lucide-react';
 import { DocumentOcrViewer } from './DocumentOcrViewer';
+import { getSampleDocumentPdfDataUrl } from '../../services/sampleDocumentGenerator';
 
 type ReviewFilterStatus = 'ALL' | 'PENDING' | 'IN_PROGRESS' | 'COMPLETED' | 'REPLACEMENT_REQUIRED';
 
@@ -62,13 +67,86 @@ export const AdminDocumentSection: React.FC = () => {
 
   // Level 3 Modal States
   const [viewingDoc, setViewingDoc] = useState<RequiredDocument | null>(null);
+  const [blobLoading, setBlobLoading] = useState(false);
+  const [loadedBlobUrl, setLoadedBlobUrl] = useState<string | null>(null);
   const [replacementPromptDoc, setReplacementPromptDoc] = useState<RequiredDocument | null>(null);
   const [replacementRemarks, setReplacementRemarks] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   useEffect(() => {
+    if (!viewingDoc) {
+      setLoadedBlobUrl(null);
+      return;
+    }
+    if (viewingDoc.fileDataUrl || viewingDoc.fileUrl) {
+      setLoadedBlobUrl(viewingDoc.fileUrl || viewingDoc.fileDataUrl || null);
+      return;
+    }
+    if (viewingDoc.fileBlobId && selectedApp?.id) {
+      setBlobLoading(true);
+      getApplicationFileBlob(selectedApp.id, viewingDoc.fileBlobId)
+        .then((url) => {
+          if (url) {
+            setLoadedBlobUrl(url);
+          } else {
+            const sampleUrl = getSampleDocumentPdfDataUrl(
+              viewingDoc.requirementId || viewingDoc.id,
+              viewingDoc.name,
+              selectedApp?.collegeName,
+              selectedApp?.academicYear
+            );
+            setLoadedBlobUrl(sampleUrl);
+          }
+        })
+        .catch((err) => {
+          console.warn('[VerifAI] Failed to load document blob:', err);
+          const sampleUrl = getSampleDocumentPdfDataUrl(
+            viewingDoc.requirementId || viewingDoc.id,
+            viewingDoc.name,
+            selectedApp?.collegeName,
+            selectedApp?.academicYear
+          );
+          setLoadedBlobUrl(sampleUrl);
+        })
+        .finally(() => {
+          setBlobLoading(false);
+        });
+    } else {
+      const sampleUrl = getSampleDocumentPdfDataUrl(
+        viewingDoc.requirementId || viewingDoc.id,
+        viewingDoc.name,
+        selectedApp?.collegeName,
+        selectedApp?.academicYear
+      );
+      setLoadedBlobUrl(sampleUrl);
+    }
+  }, [viewingDoc, selectedApp?.id, selectedApp?.collegeName, selectedApp?.academicYear]);
+
+  useEffect(() => {
     loadData();
+
+    // Live Firestore real-time listener for current application stream
+    if (isFirebaseConfigured && db) {
+      try {
+        const q = query(collection(db, 'applications'), where('type', '==', selectedType));
+        const unsub = onSnapshot(
+          q,
+          (snapshot) => {
+            const fresh = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as CollegeApplication));
+            if (fresh.length > 0) {
+              setApplications(fresh);
+              setSelectedApp((prev) => (prev ? fresh.find((a) => a.id === prev.id) || prev : null));
+            }
+          },
+          (err) => console.warn('[VerifAI] AdminDocumentSection live sync notice:', err)
+        );
+
+        return () => unsub();
+      } catch (e) {
+        console.warn('[VerifAI] AdminDocumentSection live sync setup notice:', e);
+      }
+    }
   }, [selectedType]);
 
   const loadData = async () => {
@@ -90,6 +168,15 @@ export const AdminDocumentSection: React.FC = () => {
       showNotice('error', err.message || 'Failed to load applications and checklists.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleSelectCollege = async (app: CollegeApplication) => {
+    try {
+      const freshApp = await getApplicationById(app.id, true);
+      setSelectedApp(freshApp || app);
+    } catch {
+      setSelectedApp(app);
     }
   };
 
@@ -1182,7 +1269,7 @@ export const AdminDocumentSection: React.FC = () => {
                       {/* Right: View Documents Action */}
                       <div className="flex items-center self-end md:self-center flex-shrink-0">
                         <button
-                          onClick={() => setSelectedApp(app)}
+                          onClick={() => handleSelectCollege(app)}
                           className="px-5 py-2.5 bg-blue-800 hover:bg-blue-900 text-white rounded-xl text-xs font-bold transition-all shadow-md flex items-center gap-1.5 group"
                         >
                           <Eye className="w-4 h-4 text-sky-300" />
@@ -1242,39 +1329,65 @@ export const AdminDocumentSection: React.FC = () => {
 
               {/* Display preview */}
               <div className="border border-slate-200 rounded-lg p-4 bg-white text-center space-y-3">
-                {viewingDoc.fileDataUrl && viewingDoc.fileDataUrl.startsWith('data:image') ? (
-                  <img
-                    src={viewingDoc.fileDataUrl}
-                    alt={viewingDoc.name}
-                    className="max-h-60 mx-auto rounded border"
-                  />
-                ) : (
-                  <div className="py-4 space-y-2">
-                    <FileText className="w-10 h-10 text-blue-600 mx-auto" />
-                    <p className="font-bold text-slate-800 text-xs">
-                      {viewingDoc.fileName || `${viewingDoc.name}.pdf`}
-                    </p>
-                    <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
-                      Authorized Scrutiny Dossier. Indexed in AICTE Central Records.
-                    </p>
-                    {viewingDoc.fileDataUrl && (
-                      <a
-                        href={viewingDoc.fileDataUrl}
-                        download={viewingDoc.fileName || 'document.pdf'}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-800 hover:bg-blue-900 text-white rounded-lg text-xs font-bold transition-all shadow-sm"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>Download Original File</span>
-                      </a>
-                    )}
-                  </div>
-                )}
+                {(() => {
+                  const url = loadedBlobUrl || viewingDoc.fileUrl || viewingDoc.fileDataUrl;
+                  if (blobLoading) {
+                    return (
+                      <div className="py-6 flex items-center justify-center gap-2 text-xs text-slate-500">
+                        <RefreshCw className="w-4 h-4 animate-spin text-blue-600" />
+                        <span>Loading file from secure storage...</span>
+                      </div>
+                    );
+                  }
+
+                  if (url && (url.startsWith('data:image') || /\.(jpe?g|png|webp)/i.test(viewingDoc.fileName || ''))) {
+                    return (
+                      <div className="space-y-2">
+                        <img
+                          src={url}
+                          alt={viewingDoc.name}
+                          className="max-h-60 mx-auto rounded border shadow-sm"
+                        />
+                        <a
+                          href={url}
+                          download={viewingDoc.fileName || 'image.jpg'}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-800 hover:bg-blue-900 text-white rounded-lg text-xs font-bold transition-all shadow-sm"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Download Image</span>
+                        </a>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="py-4 space-y-2">
+                      <FileText className="w-10 h-10 text-blue-600 mx-auto" />
+                      <p className="font-bold text-slate-800 text-xs">
+                        {viewingDoc.fileName || `${viewingDoc.name}.pdf`}
+                      </p>
+                      <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
+                        Authorized Scrutiny Dossier. Indexed in AICTE Central Records.
+                      </p>
+                      {url && (
+                        <a
+                          href={url}
+                          download={viewingDoc.fileName || 'document.pdf'}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-800 hover:bg-blue-900 text-white rounded-lg text-xs font-bold transition-all shadow-sm"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Download Original File</span>
+                        </a>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             </div>
 
             {/* AI Document OCR & Text Intelligence Viewer */}
             <DocumentOcrViewer
-              doc={viewingDoc}
+              doc={{ ...viewingDoc, fileDataUrl: loadedBlobUrl || viewingDoc.fileUrl || viewingDoc.fileDataUrl }}
               appId={selectedApp?.id}
               application={selectedApp || undefined}
               onOcrSaved={(updatedDoc) => {

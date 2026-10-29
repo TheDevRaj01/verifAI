@@ -6,8 +6,10 @@ import {
   loginAsAdmin,
   loginAsCollege,
   logout as authLogout,
+  ensureFirebaseAuthSession,
 } from '../services/authService';
-import { isFirebaseConfigured } from '../services/firebase';
+import { auth, isFirebaseConfigured } from '../services/firebase';
+import { onAuthStateChanged } from 'firebase/auth';
 
 export type ActiveView = 'landing' | 'college' | 'admin';
 
@@ -16,6 +18,7 @@ interface AuthContextType {
   college: CollegeAccount | null;
   isAuthenticated: boolean;
   isFirebaseLive: boolean;
+  isAuthReady: boolean;
   activeView: ActiveView;
   setActiveView: (view: ActiveView) => void;
   selectedCategory: 'EOA' | 'NEW_APPROVAL' | null;
@@ -38,6 +41,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [activeView, setActiveView] = useState<ActiveView>('landing');
   const [selectedCategory, setSelectedCategory] = useState<'EOA' | 'NEW_APPROVAL' | null>(null);
   const [pendingCategory, setPendingCategory] = useState<'EOA' | 'NEW_APPROVAL' | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState<boolean>(!isFirebaseConfigured);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastType, setToastType] = useState<'success' | 'error' | 'info'>('info');
@@ -60,6 +64,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       } else if (session.user.role === 'college') {
         setActiveView('college');
       }
+    }
+
+    if (isFirebaseConfigured && auth) {
+      const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+        if (!firebaseUser && session) {
+          // Attempt silent auto-recovery of Firebase Auth token for active session
+          try {
+            await ensureFirebaseAuthSession();
+          } catch {}
+        }
+        setIsAuthReady(true);
+      });
+      return () => unsubscribe();
+    } else {
+      setIsAuthReady(true);
     }
   }, []);
 
@@ -100,6 +119,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         college,
         isAuthenticated: !!user,
         isFirebaseLive: isFirebaseConfigured,
+        isAuthReady,
         activeView,
         setActiveView,
         selectedCategory,

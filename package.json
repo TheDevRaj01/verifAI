@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test tests/workflowValidation.test.ts tests/documentValidation.test.ts tests/duplicateDetection.test.ts tests/documentAnomalies.test.ts tests/regulatoryCompliance.test.ts tests/issuingAuthorityVerification.test.ts"
+    "test": "node --experimental-strip-types --test tests/workflowValidation.test.ts tests/documentValidation.test.ts tests/duplicateDetection.test.ts tests/documentAnomalies.test.ts tests/regulatoryCompliance.test.ts tests/issuingAuthorityVerification.test.ts tests/cloudStorageSync.test.ts tests/sparkFirestoreSync.test.ts tests/ocrServiceOperations.test.ts"
   },
   "dependencies": {
     "firebase": "^10.13.0",

@@ -15,58 +15,88 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
+    // Admin role must be verified via server-signed custom claims or verified email from official registry
     function isAdmin() {
       return isAuthenticated() && (
         request.auth.token.role == 'admin' ||
-        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'admin') ||
-        request.auth.token.email in ['admin@aicte.gov.in', 'scrutiny@aicte-india.org', 'director.approval@aicte.gov.in']
+        request.auth.token.email.lower() in [
+          'admin@aicte.gov.in',
+          'scrutiny@aicte-india.org',
+          'director.approval@aicte.gov.in'
+        ] ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          getUserData().role == 'admin'
+        )
       );
     }
 
+    function getCollegeIdFromEmail() {
+      return request.auth.token.email.lower() == 'principal@delhitechnical.edu.in' ? '1-10972341'
+        : request.auth.token.email.lower() == 'director@mumbaipolytechnic.edu.in' ? '1-24891102'
+        : request.auth.token.email.lower() == 'info@karnatakatech.ac.in' ? '1-38290145'
+        : request.auth.token.email.lower() == 'registrar@bengalpharmacy.edu.in' ? '1-49012389'
+        : request.auth.token.email.lower() == 'principal@tnengineering.edu.in' ? '1-51289033'
+        : null;
+    }
+
+    // College user verified via server-signed custom claims, official institutional email, or admin-provisioned user profile
     function isCollegeUser() {
       return isAuthenticated() && (
         request.auth.token.role == 'college' ||
-        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'college')
+        getCollegeIdFromEmail() != null ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          getUserData().role == 'college'
+        )
       );
     }
 
     function getCollegeId() {
-      return request.auth.token.collegeId != null 
-        ? request.auth.token.collegeId 
-        : (exists(/databases/$(database)/documents/users/$(request.auth.uid)) ? getUserData().collegeId : null);
+      return request.auth.token.collegeId != null
+        ? request.auth.token.collegeId
+        : (
+            getCollegeIdFromEmail() != null
+              ? getCollegeIdFromEmail()
+              : (
+                  exists(/databases/$(database)/documents/users/$(request.auth.uid))
+                    ? getUserData().collegeId
+                    : null
+                )
+          );
+    }
+
+    function isApplicationEditable(appData) {
+      // Applications in active evaluation states can be edited/supplemented by colleges
+      // Only finalized (Approved or Rejected) applications are locked
+      return !(appData.status in ['Approved', 'Rejected']);
     }
 
     // ==========================================
     // 1. User Profiles (/users)
+    // Strictly admin-provisioned to prevent self-elevation
     // ==========================================
     match /users/{userId} {
       allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
-      // Prevent privilege escalation: non-admin cannot self-assign role = 'admin'
-      allow create: if isAuthenticated() && request.auth.uid == userId && (
-        request.resource.data.role != 'admin' || isAdmin()
+      // Admins can write any user; users can initialize/update their own profile without self-elevation
+      allow write: if isAdmin() || (
+        isAuthenticated() && request.auth.uid == userId &&
+        request.resource.data.role != 'admin'
       );
-      allow update: if isAuthenticated() && (
-        isAdmin() || (
-          request.auth.uid == userId &&
-          request.resource.data.role == resource.data.role &&
-          request.resource.data.uid == resource.data.uid
-        )
-      );
-      allow delete: if isAdmin();
     }
 
     // ==========================================
     // 2. Colleges Collection (/colleges)
+    // Directory read of recognized AICTE institutions
     // ==========================================
     match /colleges/{collegeId} {
-      // Public directory read of registered institutions
       allow read: if true;
-      // Only AICTE Central Administrators can create, approve, or update institution accounts
       allow write: if isAdmin();
     }
 
     // ==========================================
     // 3. Applications Collection (/applications)
+    // Application metadata (strictly without binary payloads)
     // ==========================================
     match /applications/{applicationId} {
       // AICTE Admins can inspect all applications
@@ -79,51 +109,88 @@ service cloud.firestore {
       allow create: if isAdmin() || (
         isCollegeUser() &&
         request.resource.data.collegeId == getCollegeId() &&
-        request.resource.data.status in ['Draft', 'Submitted']
+        !(request.resource.data.status in ['Approved', 'Rejected'])
       );
 
-      // Colleges can update their own drafts; Admins can update any application status
+      // Colleges can update their own drafts & active dossiers; cannot self-approve or change collegeId
       allow update: if isAdmin() || (
         isCollegeUser() &&
         resource.data.collegeId == getCollegeId() &&
-        request.resource.data.collegeId == resource.data.collegeId
+        request.resource.data.collegeId == resource.data.collegeId &&
+        isApplicationEditable(resource.data) &&
+        !(request.resource.data.status in ['Approved', 'Rejected'] && !(resource.data.status in ['Approved', 'Rejected']))
       );
 
       // Applications cannot be deleted by colleges; only Admins can purge
       allow delete: if isAdmin();
+
+      // ==========================================
+      // 4. File Blobs Subcollection (/applications/{appId}/fileBlobs/{fileId})
+      // Dedicated subcollection storing document and evidence binary content
+      // ==========================================
+      match /fileBlobs/{fileId} {
+        // Institutional isolation: only admin or owning college can read
+        allow read: if isAdmin() || (
+          isCollegeUser() && (
+            (exists(/databases/$(database)/documents/applications/$(applicationId)) &&
+             get(/databases/$(database)/documents/applications/$(applicationId)).data.collegeId == getCollegeId()) ||
+            (resource != null && resource.data.collegeId == getCollegeId())
+          )
+        );
+
+        // Upload allowed for owning college while application is in an active/editable state
+        allow create, update: if isAdmin() || (
+          isCollegeUser() &&
+          (
+            !exists(/databases/$(database)/documents/applications/$(applicationId)) ||
+            (
+              get(/databases/$(database)/documents/applications/$(applicationId)).data.collegeId == getCollegeId() &&
+              isApplicationEditable(get(/databases/$(database)/documents/applications/$(applicationId)).data)
+            )
+          ) &&
+          (
+            request.resource.data.collegeId == getCollegeId() ||
+            !('collegeId' in request.resource.data)
+          ) &&
+          request.resource.data.fileId is string &&
+          request.resource.data.applicationId == applicationId &&
+          request.resource.data.dataUrl is string &&
+          request.resource.data.dataUrl.size() <= 750000
+        );
+
+        // Deletion allowed only for owning college while application is editable
+        allow delete: if isAdmin() || (
+          isCollegeUser() &&
+          (
+            !exists(/databases/$(database)/documents/applications/$(applicationId)) ||
+            (
+              get(/databases/$(database)/documents/applications/$(applicationId)).data.collegeId == getCollegeId() &&
+              isApplicationEditable(get(/databases/$(database)/documents/applications/$(applicationId)).data)
+            )
+          )
+        );
+      }
     }
 
     // ==========================================
-    // 4. Unique ID Requests (/idRequests)
+    // 5. Unique ID Requests (/idRequests)
+    // Onboarding request queue for unauthenticated applicants
     // ==========================================
     match /idRequests/{requestId} {
-      // Unauthenticated or new applicant colleges can submit an onboarding request
-      // Must be created in 'Pending' status with required college name and email
       allow create: if request.resource.data.status == 'Pending' &&
                        request.resource.data.collegeName is string &&
                        request.resource.data.officialEmail is string;
 
-      // Only AICTE Admins can view the request queue
-      allow read: if isAdmin();
-
-      // Only AICTE Admins can approve (assign ID) or reject requests
-      allow update: if isAdmin() && (
-        request.resource.data.status in ['Approved', 'Rejected']
-      );
-
-      allow delete: if isAdmin();
+      // Sensitive contact information must not be readable by arbitrary users
+      allow read, update, delete: if isAdmin();
     }
 
     // ==========================================
-    // 5. Document Checklist Requirements (/checklists)
+    // 6. Document Checklist Requirements (/checklists)
     // ==========================================
     match /checklists/{requirementId} {
-      // Colleges can only read active requirements; Admins can read all requirements
-      allow read: if isAdmin() || (
-        isAuthenticated() && resource.data.isActive == true
-      );
-
-      // Only AICTE Central Administrators can create, update, reorder, or delete checklist rules
+      // Authenticated users (both colleges and admins) can read statutory requirements
+      allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
   }

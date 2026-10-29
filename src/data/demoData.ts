@@ -1,10 +1,11 @@
 import type { CollegeAccount, CollegeApplication, UniqueIdRequest, ChecklistRequirement } from '../types/index.ts';
+import { getSampleDocumentPdfDataUrl } from '../services/sampleDocumentGenerator.ts';
 
 export const INITIAL_DEMO_COLLEGES: CollegeAccount[] = [
   {
     collegeId: '1-10972341',
-    collegeName: 'Delhi Institute of Engineering & Advanced Technology',
-    officialEmail: 'principal@dieat.ac.in',
+    collegeName: 'Delhi Institute of Engineering & Technology',
+    officialEmail: 'principal@delhitechnical.edu.in',
     state: 'Delhi',
     district: 'New Delhi',
     institutionType: 'Engineering & Technology',
@@ -16,8 +17,8 @@ export const INITIAL_DEMO_COLLEGES: CollegeAccount[] = [
   },
   {
     collegeId: '1-24891102',
-    collegeName: 'Maharashtra Institute of Technical Sciences',
-    officialEmail: 'admin@mits-pune.edu.in',
+    collegeName: 'Maharashtra Polytechnic & Technology Academy',
+    officialEmail: 'director@mumbaipolytechnic.edu.in',
     state: 'Maharashtra',
     district: 'Pune',
     institutionType: 'Engineering & Technology',
@@ -29,8 +30,8 @@ export const INITIAL_DEMO_COLLEGES: CollegeAccount[] = [
   },
   {
     collegeId: '1-38290145',
-    collegeName: 'Karnataka Apex Academy of Management & Technology',
-    officialEmail: 'registrar@apex-karnataka.org',
+    collegeName: 'Bengaluru Technical Institute',
+    officialEmail: 'info@karnatakatech.ac.in',
     state: 'Karnataka',
     district: 'Bengaluru Urban',
     institutionType: 'Management & Technology',
@@ -42,12 +43,12 @@ export const INITIAL_DEMO_COLLEGES: CollegeAccount[] = [
   },
   {
     collegeId: '1-49012389',
-    collegeName: 'Tamil Nadu College of Architecture & Planning',
-    officialEmail: 'contact@tncap.ac.in',
-    state: 'Tamil Nadu',
-    district: 'Chennai',
-    institutionType: 'Architecture & Planning',
-    authorizedPerson: 'Ar. Meenakshi Sundaram',
+    collegeName: 'Bengal Institute of Pharmaceutical Sciences',
+    officialEmail: 'registrar@bengalpharmacy.edu.in',
+    state: 'West Bengal',
+    district: 'Kolkata',
+    institutionType: 'Pharmacy',
+    authorizedPerson: 'Dr. S. K. Mukherjee',
     status: 'Active',
     createdAt: '2020-08-10',
     currentApplicationsCount: 1,
@@ -55,12 +56,12 @@ export const INITIAL_DEMO_COLLEGES: CollegeAccount[] = [
   },
   {
     collegeId: '1-51289033',
-    collegeName: 'Aryavart Institute of Pharmaceutical Studies',
-    officialEmail: 'info@aryavartpharma.edu.in',
-    state: 'Uttar Pradesh',
-    district: 'Lucknow',
-    institutionType: 'Pharmacy',
-    authorizedPerson: 'Dr. Vivek Tripathi',
+    collegeName: 'Tamil Nadu College of Architecture & Planning',
+    officialEmail: 'principal@tnengineering.edu.in',
+    state: 'Tamil Nadu',
+    district: 'Chennai',
+    institutionType: 'Architecture & Planning',
+    authorizedPerson: 'Ar. Meenakshi Sundaram',
     status: 'Active',
     createdAt: '2023-01-18',
     currentApplicationsCount: 1,
@@ -439,6 +440,22 @@ export const INITIAL_DEMO_APPLICATIONS: CollegeApplication[] = [
     ]
   }
 ];
+
+// Ensure all initial demo application documents have valid base64 PDF payloads for instant preview and OCR
+INITIAL_DEMO_APPLICATIONS.forEach((app) => {
+  if (app.documents) {
+    app.documents.forEach((doc) => {
+      if (!doc.fileDataUrl && !doc.fileUrl) {
+        doc.fileDataUrl = getSampleDocumentPdfDataUrl(
+          doc.requirementId || doc.id,
+          doc.name,
+          app.collegeName,
+          app.academicYear
+        );
+      }
+    });
+  }
+});
 
 export const INITIAL_DEMO_ID_REQUESTS: UniqueIdRequest[] = [
   {

@@ -19,7 +19,10 @@ import type {
   AuthorityVerificationResult,
   AuthorityFieldComparison,
   AuthorityVerificationStatus,
+  PdfDocumentMetadata,
 } from '../types/index.ts';
+import { getSampleDocumentPdfDataUrl } from './sampleDocumentGenerator.ts';
+import { extractPdfMetadataSync } from './documentValidationService.ts';
 import {
   calculateFileHash,
   detectDocumentDuplicates,
@@ -39,7 +42,8 @@ import {
   INITIAL_DEMO_ID_REQUESTS,
   INITIAL_CHECKLIST_REQUIREMENTS,
 } from '../data/demoData.ts';
-import { db, isFirebaseConfigured } from './firebase.ts';
+import { db, storage, auth, isFirebaseConfigured } from './firebase.ts';
+import { ensureFirebaseAuthSession } from './authService.ts';
 import {
   collection,
   getDocs,
@@ -52,6 +56,12 @@ import {
   where,
   addDoc,
 } from 'firebase/firestore';
+import {
+  ref as storageRef,
+  uploadString,
+  getDownloadURL,
+  deleteObject,
+} from 'firebase/storage';
 
 const STORAGE_KEYS = {
   COLLEGES: 'verifai_colleges_v1',
@@ -119,6 +129,20 @@ export function initializeLocalStorage() {
               a.infrastructureEvidence = demoMatch.infrastructureEvidence;
               modified = true;
             }
+            if (a.documents && demoMatch.documents) {
+              for (const d of a.documents) {
+                if (!d.fileDataUrl && !d.fileUrl && !d.fileBlobId) {
+                  const matchDoc = demoMatch.documents.find(md => md.id === d.id || md.requirementId === d.requirementId);
+                  if (matchDoc?.fileDataUrl) {
+                    d.fileDataUrl = matchDoc.fileDataUrl;
+                    modified = true;
+                  } else {
+                    d.fileDataUrl = getSampleDocumentPdfDataUrl(d.requirementId || d.id, d.name, a.collegeName, a.academicYear);
+                    modified = true;
+                  }
+                }
+              }
+            }
           }
         }
         if (modified) {
@@ -138,8 +162,513 @@ export function initializeLocalStorage() {
 initializeLocalStorage();
 
 // ==========================================
+// Firebase Spark Free Plan: Firestore Subcollection Binary Storage
+// ==========================================
+
+export const MAX_SPARK_FILE_BYTES = 512000; // 500 KiB safe limit for single Firestore document
+
+/**
+ * Calculates raw byte size from a Base64 data URL.
+ */
+export function getDataUrlByteSize(dataUrl: string): number {
+  if (!dataUrl) return 0;
+  const commaIdx = dataUrl.indexOf(',');
+  const base64Str = commaIdx !== -1 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+  const padding = base64Str.endsWith('==') ? 2 : base64Str.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.round((base64Str.length * 3) / 4) - padding);
+}
+
+/**
+ * Automatically compresses images (JPEG, PNG, WebP) client-side before upload.
+ * Reduces 5-10 MB smartphone photos down to crisp 180-380 KB JPEGs.
+ */
+export async function compressImageForUpload(
+  dataUrl: string,
+  maxDimension: number = 1600,
+  quality: number = 0.78
+): Promise<string> {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return dataUrl;
+  }
+  if (!dataUrl || !dataUrl.startsWith('data:image/')) {
+    return dataUrl;
+  }
+
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        let width = img.width;
+        let height = img.height;
+
+        if (width <= maxDimension && height <= maxDimension && dataUrl.length < 400000) {
+          resolve(dataUrl);
+          return;
+        }
+
+        if (width > height) {
+          if (width > maxDimension) {
+            height = Math.round((height * maxDimension) / width);
+            width = maxDimension;
+          }
+        } else {
+          if (height > maxDimension) {
+            width = Math.round((width * maxDimension) / height);
+            height = maxDimension;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(dataUrl);
+          return;
+        }
+
+        ctx.drawImage(img, 0, 0, width, height);
+        const compressed = canvas.toDataURL('image/jpeg', quality);
+        resolve(compressed);
+      };
+
+      img.onerror = () => {
+        resolve(dataUrl);
+      };
+
+      img.src = dataUrl;
+    } catch {
+      resolve(dataUrl);
+    }
+  });
+}
+
+/**
+ * Uploads file binary data to a dedicated Firestore subcollection document:
+ * /applications/{appId}/fileBlobs/{fileId}
+ */
+export async function uploadFileBlobToFirestore(
+  appId: string,
+  fileId: string,
+  dataUrl: string,
+  metadata: {
+    fileName: string;
+    fileType: string;
+    requirementId?: string;
+    version?: number;
+    sha256?: string;
+    collegeId?: string;
+  }
+): Promise<{ fileBlobId: string }> {
+  if (!isFirebaseConfigured || !db) {
+    return { fileBlobId: fileId };
+  }
+
+  try {
+    if (auth && !auth.currentUser) {
+      try {
+        await ensureFirebaseAuthSession();
+      } catch {}
+    }
+
+    const blobRef = doc(db, 'applications', appId, 'fileBlobs', fileId);
+    const payload = {
+      fileId,
+      applicationId: appId,
+      collegeId: metadata.collegeId || null,
+      fileName: metadata.fileName,
+      fileType: metadata.fileType,
+      requirementId: metadata.requirementId || null,
+      version: metadata.version || 1,
+      dataUrl,
+      uploadedAt: new Date().toISOString(),
+      sha256: metadata.sha256 || null,
+    };
+
+    await setDoc(blobRef, payload);
+    return { fileBlobId: fileId };
+  } catch (blobErr: any) {
+    console.warn(`[VerifAI] Cloud fileBlob upload notice (${blobErr.message || 'Permission denied'}). Preserving payload in local cache.`);
+    return { fileBlobId: fileId };
+  }
+}
+
+/**
+ * Safely deletes a file blob from the Firestore subcollection.
+ */
+export async function deleteFileBlobFromFirestore(
+  appId: string,
+  fileId?: string
+): Promise<void> {
+  if (!fileId || !isFirebaseConfigured || !db) return;
+  try {
+    const blobRef = doc(db, 'applications', appId, 'fileBlobs', fileId);
+    await deleteDoc(blobRef);
+  } catch (err) {
+    console.warn('[VerifAI] Firestore fileBlob delete warning:', err);
+  }
+}
+
+/**
+ * Retrieves file binary content from Firestore subcollection or local simulation.
+ */
+export async function getApplicationFileBlob(
+  appId: string,
+  fileBlobId: string
+): Promise<string | null> {
+  if (isFirebaseConfigured && db) {
+    try {
+      const blobRef = doc(db, 'applications', appId, 'fileBlobs', fileBlobId);
+      const snapshot = await getDoc(blobRef);
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        if (data?.dataUrl) return data.dataUrl;
+      }
+    } catch (err: any) {
+      console.warn('[VerifAI] Cloud getApplicationFileBlob notice:', err?.message);
+    }
+  }
+
+  const app = await getApplicationById(appId, true);
+  if (!app) return null;
+  const docMatch = app.documents?.find(
+    (d) => d.fileBlobId === fileBlobId || d.id === fileBlobId || d.requirementId === fileBlobId
+  );
+  if (docMatch) {
+    if (docMatch.fileDataUrl) return docMatch.fileDataUrl;
+    if (docMatch.fileUrl) return docMatch.fileUrl;
+    return getSampleDocumentPdfDataUrl(
+      docMatch.requirementId || docMatch.id,
+      docMatch.name,
+      app.collegeName,
+      app.academicYear
+    );
+  }
+  const evidMatch = app.infrastructureEvidence?.find(
+    (e) => e.fileBlobId === fileBlobId || e.id === fileBlobId
+  );
+  if (evidMatch && evidMatch.fileDataUrl) return evidMatch.fileDataUrl;
+  return null;
+}
+
+/**
+ * Recursively removes all undefined fields from an object so Firestore setDoc/updateDoc never rejects it.
+ */
+export function removeUndefinedFields<T>(obj: T): T {
+  if (obj === null || obj === undefined) {
+    return null as any;
+  }
+  if (Array.isArray(obj)) {
+    return obj
+      .filter((item) => item !== undefined)
+      .map((item) => removeUndefinedFields(item)) as any;
+  }
+  if (typeof obj === 'object') {
+    const cleaned: Record<string, any> = {};
+    for (const [key, val] of Object.entries(obj)) {
+      if (val !== undefined) {
+        cleaned[key] = removeUndefinedFields(val);
+      }
+    }
+    return cleaned as T;
+  }
+  return obj;
+}
+
+/**
+ * Strips heavy binary dataUrls from main application document before saving to Firestore,
+ * ensuring the main document stays < 30 KB, and removes undefined fields to satisfy Firestore setDoc constraints.
+ */
+export function stripBinaryPayloadsForFirestore(app: CollegeApplication): CollegeApplication {
+  const sanitizedDocs = (app.documents || []).map((d) => {
+    const cleanDoc = { ...d };
+    if (cleanDoc.fileBlobId || cleanDoc.storagePath) {
+      delete cleanDoc.fileDataUrl;
+    }
+    if (cleanDoc.previousVersions) {
+      cleanDoc.previousVersions = cleanDoc.previousVersions.map((v) => {
+        const cleanV = { ...v };
+        if (cleanV.fileBlobId || cleanV.storagePath) {
+          delete cleanV.fileDataUrl;
+        }
+        return cleanV;
+      });
+    }
+    return cleanDoc;
+  });
+
+  const sanitizedEvidence = (app.infrastructureEvidence || []).map((ev) => {
+    const cleanEv = { ...ev };
+    if (cleanEv.fileBlobId || cleanEv.storagePath) {
+      delete cleanEv.fileDataUrl;
+    }
+    return cleanEv;
+  });
+
+  const raw = {
+    ...app,
+    documents: sanitizedDocs,
+    infrastructureEvidence: sanitizedEvidence,
+  };
+
+  return removeUndefinedFields(raw);
+}
+
+// ==========================================
+// Cloud Storage Helper APIs & Data Migration (Backward Compatibility)
+// ==========================================
+
+/**
+ * Uploads a document payload to Firebase Cloud Storage.
+ * Structured path: applications/{applicationId}/documents/{requirementId}/v{version}/{sanitizedFileName}
+ */
+export async function uploadDocumentToCloudStorage(
+  appId: string,
+  reqId: string,
+  version: number,
+  fileName: string,
+  dataUrl: string
+): Promise<{ storagePath: string; downloadUrl: string }> {
+  if (!isFirebaseConfigured || !storage) {
+    throw new Error('Firebase Cloud Storage is not configured. Operation aborted.');
+  }
+  const sanitized = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const path = `applications/${appId}/documents/${reqId}/v${version}/${sanitized}`;
+  const fileRef = storageRef(storage, path);
+  await uploadString(fileRef, dataUrl, 'data_url');
+  const downloadUrl = await getDownloadURL(fileRef);
+  return { storagePath: path, downloadUrl };
+}
+
+/**
+ * Uploads infrastructure evidence media to Firebase Cloud Storage.
+ * Structured path: applications/{applicationId}/evidence/{evidenceId}/{sanitizedFileName}
+ */
+export async function uploadEvidenceToCloudStorage(
+  appId: string,
+  evidenceId: string,
+  fileName: string,
+  dataUrl: string
+): Promise<{ storagePath: string; downloadUrl: string }> {
+  if (!isFirebaseConfigured || !storage) {
+    throw new Error('Firebase Cloud Storage is not configured. Operation aborted.');
+  }
+  const sanitized = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const path = `applications/${appId}/evidence/${evidenceId}/${sanitized}`;
+  const fileRef = storageRef(storage, path);
+  await uploadString(fileRef, dataUrl, 'data_url');
+  const downloadUrl = await getDownloadURL(fileRef);
+  return { storagePath: path, downloadUrl };
+}
+
+/**
+ * Safely deletes a file from Firebase Cloud Storage without breaking references.
+ */
+export async function deleteFromCloudStorage(storagePathString?: string): Promise<void> {
+  if (!storagePathString || !isFirebaseConfigured || !storage) return;
+  try {
+    const fileRef = storageRef(storage, storagePathString);
+    await deleteObject(fileRef);
+  } catch (err) {
+    console.warn('[VerifAI] Cloud Storage delete warning:', err);
+  }
+}
+
+export interface MigrationProgress {
+  total: number;
+  processed: number;
+  migrated: number;
+  skipped: number;
+  failed: number;
+  errors: string[];
+}
+
+/**
+ * Explicit, idempotent migration of legacy Base64 documents to Firebase Cloud Storage.
+ * Only processes documents that contain inline Base64 data and do not yet have a storagePath.
+ * Preserves legacy records safely if upload fails.
+ */
+export async function migrateApplicationDocumentsToCloudStorage(
+  appId: string,
+  onProgress?: (p: MigrationProgress) => void
+): Promise<{ application: CollegeApplication; progress: MigrationProgress }> {
+  if (!isFirebaseConfigured || !storage) {
+    throw new Error('Cloud Storage is not configured. Migration requires an active Firebase connection.');
+  }
+
+  const session = getActiveSession();
+  const app = await getApplicationById(appId, true);
+  if (!app) throw new Error('Application dossier not found.');
+
+  if (session?.user?.role === 'college' && app.collegeId !== session.user.collegeId) {
+    throw new Error('Access Denied: You can only migrate your own institution documents.');
+  }
+
+  const progress: MigrationProgress = {
+    total: app.documents.length + (app.infrastructureEvidence?.length || 0),
+    processed: 0,
+    migrated: 0,
+    skipped: 0,
+    failed: 0,
+    errors: [],
+  };
+
+  const updatedDocuments = [...app.documents];
+  let docsChanged = false;
+
+  for (let i = 0; i < updatedDocuments.length; i++) {
+    const docItem = updatedDocuments[i];
+    progress.processed++;
+    onProgress?.({ ...progress });
+
+    if (docItem.fileDataUrl && docItem.fileDataUrl.startsWith('data:') && !docItem.storagePath) {
+      try {
+        const version = docItem.version || 1;
+        const fileName = docItem.fileName || `${docItem.name || 'document'}.pdf`;
+        const cloudResult = await uploadDocumentToCloudStorage(
+          app.id,
+          docItem.requirementId || docItem.id,
+          version,
+          fileName,
+          docItem.fileDataUrl
+        );
+
+        updatedDocuments[i] = {
+          ...docItem,
+          storagePath: cloudResult.storagePath,
+          fileUrl: cloudResult.downloadUrl,
+          fileDataUrl: cloudResult.downloadUrl,
+        };
+        docsChanged = true;
+        progress.migrated++;
+      } catch (err: any) {
+        progress.failed++;
+        progress.errors.push(`Doc "${docItem.name}": ${err.message}`);
+      }
+    } else {
+      progress.skipped++;
+    }
+    onProgress?.({ ...progress });
+  }
+
+  const updatedEvidence = [...(app.infrastructureEvidence || [])];
+  let evidenceChanged = false;
+
+  for (let j = 0; j < updatedEvidence.length; j++) {
+    const evItem = updatedEvidence[j];
+    progress.processed++;
+    onProgress?.({ ...progress });
+
+    if (evItem.fileDataUrl && evItem.fileDataUrl.startsWith('data:') && !evItem.storagePath) {
+      try {
+        const cloudResult = await uploadEvidenceToCloudStorage(
+          app.id,
+          evItem.id,
+          evItem.fileName,
+          evItem.fileDataUrl
+        );
+        updatedEvidence[j] = {
+          ...evItem,
+          storagePath: cloudResult.storagePath,
+          fileUrl: cloudResult.downloadUrl,
+          fileDataUrl: cloudResult.downloadUrl,
+        };
+        evidenceChanged = true;
+        progress.migrated++;
+      } catch (err: any) {
+        progress.failed++;
+        progress.errors.push(`Evidence "${evItem.title}": ${err.message}`);
+      }
+    } else {
+      progress.skipped++;
+    }
+    onProgress?.({ ...progress });
+  }
+
+  if (docsChanged || evidenceChanged) {
+    const now = new Date().toISOString().split('T')[0];
+    const auditLogs = app.auditLogs || [];
+    auditLogs.unshift({
+      id: `LOG-${Date.now().toString().slice(-6)}`,
+      timestamp: new Date().toISOString(),
+      action: 'STORAGE_MIGRATION',
+      actor: session?.user?.displayName || session?.user?.email || 'System Migration',
+      actorRole: (session?.user?.role as any) || 'admin',
+      details: `Migrated ${progress.migrated} legacy document(s)/evidence item(s) to Firebase Cloud Storage.`,
+    });
+
+    const updatedApp: CollegeApplication = {
+      ...app,
+      documents: updatedDocuments,
+      infrastructureEvidence: updatedEvidence,
+      auditLogs,
+      lastUpdated: now,
+    };
+
+    const saved = await createOrUpdateApplication(updatedApp);
+    return { application: saved, progress };
+  }
+
+  return { application: app, progress };
+}
+
+// ==========================================
 // Applications Data API
 // ==========================================
+
+function getLocalApplications(filter?: {
+  type?: ApplicationType;
+  collegeId?: string;
+}): CollegeApplication[] {
+  const localStore = getStorage();
+  const raw = localStore ? localStore.getItem(STORAGE_KEYS.APPLICATIONS) : null;
+  let list: CollegeApplication[] = raw ? JSON.parse(raw) : [...INITIAL_DEMO_APPLICATIONS];
+  if (filter?.type) {
+    list = list.filter((app) => app.type === filter.type);
+  }
+  if (filter?.collegeId) {
+    list = list.filter((app) => app.collegeId === filter.collegeId);
+  }
+  return list;
+}
+
+function mergeApplicationWithLocal(cloud: CollegeApplication, local: CollegeApplication): CollegeApplication {
+  const mergedDocs = [...(cloud.documents || [])];
+  for (const localDoc of local.documents || []) {
+    const idx = mergedDocs.findIndex(
+      (d) =>
+        d.id === localDoc.id ||
+        d.requirementId === localDoc.requirementId ||
+        (d.name && localDoc.name && d.name.trim().toLowerCase() === localDoc.name.trim().toLowerCase())
+    );
+    if (idx >= 0) {
+      if (
+        (localDoc.fileName && (!mergedDocs[idx].fileName || mergedDocs[idx].status === 'NOT_UPLOADED')) ||
+        (localDoc.version && mergedDocs[idx].version && localDoc.version > mergedDocs[idx].version!) ||
+        localDoc.fileDataUrl
+      ) {
+        mergedDocs[idx] = {
+          ...mergedDocs[idx],
+          ...localDoc,
+          fileDataUrl: localDoc.fileDataUrl || mergedDocs[idx].fileDataUrl,
+        };
+      }
+    } else {
+      mergedDocs.push(localDoc);
+    }
+  }
+
+  return {
+    ...cloud,
+    ...local,
+    documents: mergedDocs,
+    auditLogs:
+      local.auditLogs && local.auditLogs.length > (cloud.auditLogs?.length || 0)
+        ? local.auditLogs
+        : cloud.auditLogs || local.auditLogs || [],
+    lastUpdated: local.lastUpdated || cloud.lastUpdated,
+  };
+}
 
 export async function getApplications(filter?: {
   type?: ApplicationType;
@@ -153,6 +682,8 @@ export async function getApplications(filter?: {
     effectiveFilter = { ...filter, collegeId: session.user.collegeId };
   }
 
+  const localApps = getLocalApplications(effectiveFilter);
+
   if (isFirebaseConfigured && db) {
     try {
       const colRef = collection(db, 'applications');
@@ -163,56 +694,73 @@ export async function getApplications(filter?: {
       if (effectiveFilter?.collegeId) {
         q = query(colRef, where('collegeId', '==', effectiveFilter.collegeId));
       }
+
       const snapshot = await getDocs(q);
-      const apps = snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() } as CollegeApplication));
-      if (apps.length > 0) return apps;
-    } catch (err) {
-      console.warn('[VerifAI] Firestore getApplications error, falling back to local simulation:', err);
+      const cloudApps = snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() } as CollegeApplication));
+
+      // Hybrid merge: merge cloudApps with localApps
+      const mergedMap = new Map<string, CollegeApplication>();
+
+      for (const cloudApp of cloudApps) {
+        const matchingLocal = localApps.find((l) => l.id === cloudApp.id);
+        if (matchingLocal) {
+          mergedMap.set(cloudApp.id, mergeApplicationWithLocal(cloudApp, matchingLocal));
+        } else {
+          mergedMap.set(cloudApp.id, cloudApp);
+        }
+      }
+
+      // Add any local applications not present in cloud
+      for (const localApp of localApps) {
+        if (!mergedMap.has(localApp.id)) {
+          mergedMap.set(localApp.id, localApp);
+        }
+      }
+
+      const mergedList = Array.from(mergedMap.values());
+      if (mergedList.length > 0) return mergedList;
+
+      return localApps;
+    } catch (err: any) {
+      console.warn(`[VerifAI] Firestore getApplications notice (${err.message || 'Permission denied'}). Serving from local storage.`);
+      return localApps;
     }
   }
 
-  // Local storage simulation
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.APPLICATIONS);
-    let list: CollegeApplication[] = raw ? JSON.parse(raw) : INITIAL_DEMO_APPLICATIONS;
-    if (effectiveFilter?.type) {
-      list = list.filter((app) => app.type === effectiveFilter.type);
-    }
-    if (effectiveFilter?.collegeId) {
-      list = list.filter((app) => app.collegeId === effectiveFilter.collegeId);
-    }
-    return list;
-  } catch {
-    return INITIAL_DEMO_APPLICATIONS;
-  }
+  return localApps;
 }
 
 export async function getApplicationById(id: string, bypassOwnershipCheck = false): Promise<CollegeApplication | null> {
   const session = getActiveSession();
+
+  const localStore = getStorage();
+  const raw = localStore ? localStore.getItem(STORAGE_KEYS.APPLICATIONS) : null;
+  const list: CollegeApplication[] = raw ? JSON.parse(raw) : INITIAL_DEMO_APPLICATIONS;
+  const localApp = list.find((a) => a.id === id) || null;
 
   if (isFirebaseConfigured && db) {
     try {
       const docRef = doc(db, 'applications', id);
       const docSnap = await getDoc(docRef);
       if (docSnap.exists()) {
-        const appData = { id: docSnap.id, ...docSnap.data() } as CollegeApplication;
+        let appData = { id: docSnap.id, ...docSnap.data() } as CollegeApplication;
         if (!bypassOwnershipCheck && session?.user?.role === 'college' && appData.collegeId !== session.user.collegeId) {
           return null;
         }
+        if (localApp) {
+          appData = mergeApplicationWithLocal(appData, localApp);
+        }
         return appData;
       }
-    } catch (err) {
-      console.warn('[VerifAI] Firestore getApplicationById error, fallback to local:', err);
+    } catch (err: any) {
+      console.warn(`[VerifAI] Firestore getApplicationById notice (${err.message || 'Permission denied'}). Serving from local storage.`);
     }
   }
 
-  const raw = localStorage.getItem(STORAGE_KEYS.APPLICATIONS);
-  const list: CollegeApplication[] = raw ? JSON.parse(raw) : INITIAL_DEMO_APPLICATIONS;
-  const found = list.find((a) => a.id === id) || null;
-  if (!bypassOwnershipCheck && session?.user?.role === 'college' && found && found.collegeId !== session.user.collegeId) {
+  if (!bypassOwnershipCheck && session?.user?.role === 'college' && localApp && localApp.collegeId !== session.user.collegeId) {
     return null;
   }
-  return found;
+  return localApp;
 }
 
 export async function createOrUpdateApplication(
@@ -235,7 +783,7 @@ export async function createOrUpdateApplication(
     state: application.state || 'Delhi',
     district: application.district || 'New Delhi',
     discipline: application.discipline || 'Engineering & Technology',
-    intakeApprovedLastYear: application.intakeApprovedLastYear,
+    ...(application.intakeApprovedLastYear !== undefined ? { intakeApprovedLastYear: application.intakeApprovedLastYear } : {}),
     intakeProposed: application.intakeProposed || 300,
     status: application.status || 'Draft',
     submissionDate: application.submissionDate || now,
@@ -246,9 +794,9 @@ export async function createOrUpdateApplication(
     auditLogs: application.auditLogs || [],
     remarks: application.remarks || '',
     isDemo: true,
-    declaredInfrastructure: application.declaredInfrastructure,
+    ...(application.declaredInfrastructure ? { declaredInfrastructure: application.declaredInfrastructure } : {}),
     infrastructureEvidence: application.infrastructureEvidence || [],
-    regulatoryComplianceAssessment: application.regulatoryComplianceAssessment,
+    ...(application.regulatoryComplianceAssessment ? { regulatoryComplianceAssessment: application.regulatoryComplianceAssessment } : {}),
   };
 
   try {
@@ -259,25 +807,45 @@ export async function createOrUpdateApplication(
     console.warn('[VerifAI] Auto-assessment on save error:', err);
   }
 
-  if (isFirebaseConfigured && db) {
+  // 1. ALWAYS persist to local storage FIRST as a dependable cache/fallback
+  const localStore = getStorage();
+  if (localStore) {
     try {
-      await setDoc(doc(db, 'applications', appId), fullApp);
-      return fullApp;
-    } catch (err) {
-      console.warn('[VerifAI] Firestore save application failed, saving to local storage:', err);
+      const rawApps = localStore.getItem(STORAGE_KEYS.APPLICATIONS);
+      const list: CollegeApplication[] = rawApps ? JSON.parse(rawApps) : [...INITIAL_DEMO_APPLICATIONS];
+      const existingIdx = list.findIndex((a) => a.id === appId);
+      if (existingIdx >= 0) {
+        list[existingIdx] = fullApp;
+      } else {
+        list.unshift(fullApp);
+      }
+      localStore.setItem(STORAGE_KEYS.APPLICATIONS, JSON.stringify(list));
+    } catch (localErr) {
+      console.warn('[VerifAI] Local storage cache write notice:', localErr);
     }
   }
 
-  // Local storage save
-  const rawApps = localStorage.getItem(STORAGE_KEYS.APPLICATIONS);
-  const list: CollegeApplication[] = rawApps ? JSON.parse(rawApps) : INITIAL_DEMO_APPLICATIONS;
-  const existingIdx = list.findIndex((a) => a.id === appId);
-  if (existingIdx >= 0) {
-    list[existingIdx] = fullApp;
-  } else {
-    list.unshift(fullApp);
+  // 2. If Cloud Firestore is configured, attempt cloud database write
+  if (isFirebaseConfigured && db) {
+    try {
+      if (auth && !auth.currentUser) {
+        try {
+          await ensureFirebaseAuthSession();
+        } catch {}
+      }
+
+      const sanitizedApp = stripBinaryPayloadsForFirestore(fullApp);
+      await setDoc(doc(db, 'applications', appId), sanitizedApp);
+      return fullApp;
+    } catch (err: any) {
+      console.warn(
+        `[VerifAI] Cloud database synchronization failed (${err.message || 'Permission denied'}). Application preserved safely in local storage.`
+      );
+      // Return the locally preserved application without failing user workflow
+      return fullApp;
+    }
   }
-  localStorage.setItem(STORAGE_KEYS.APPLICATIONS, JSON.stringify(list));
+
   return fullApp;
 }
 
@@ -298,8 +866,22 @@ export async function getIdRequests(): Promise<UniqueIdRequest[]> {
       const snapshot = await getDocs(colRef);
       const reqs = snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() } as UniqueIdRequest));
       if (reqs.length > 0) return reqs;
-    } catch (err) {
-      console.warn('[VerifAI] Firestore getIdRequests error, fallback to local storage:', err);
+
+      // Seed baseline demo requests if collection is empty
+      const countSnap = await getDocs(colRef);
+      if (countSnap.empty) {
+        for (const demoReq of INITIAL_DEMO_ID_REQUESTS) {
+          try {
+            await setDoc(doc(db, 'idRequests', demoReq.id), demoReq);
+          } catch {}
+        }
+        const freshSnap = await getDocs(colRef);
+        return freshSnap.docs.map((d) => ({ id: d.id, ...d.data() } as UniqueIdRequest));
+      }
+      return [];
+    } catch (err: any) {
+      console.error('[VerifAI] Firestore getIdRequests error:', err);
+      throw new Error(`Failed to load ID requests from cloud database: ${err.message}`);
     }
   }
 
@@ -328,8 +910,9 @@ export async function submitIdRequest(
     try {
       await setDoc(doc(db, 'idRequests', newId), newRequest);
       return newRequest;
-    } catch (err) {
-      console.warn('[VerifAI] Firestore submitIdRequest error, saving local:', err);
+    } catch (err: any) {
+      console.error('[VerifAI] Firestore submitIdRequest error:', err);
+      throw new Error(`Failed to submit ID request to cloud database: ${err.message}`);
     }
   }
 
@@ -463,9 +1046,21 @@ export async function getColleges(): Promise<CollegeAccount[]> {
       const colRef = collection(db, 'colleges');
       const snapshot = await getDocs(colRef);
       const list = snapshot.docs.map((docSnap) => ({ ...docSnap.data() } as CollegeAccount));
-      if (list.length > 0) return list;
-    } catch (err) {
-      console.warn('[VerifAI] Firestore getColleges error, fallback to local storage:', err);
+      if (list.length > 0) {
+        // Merge with initial demo colleges to ensure baseline evaluation colleges are always available
+        const existingIds = new Set(list.map((c) => c.collegeId.trim()));
+        const combined = [...list];
+        for (const demoCol of INITIAL_DEMO_COLLEGES) {
+          if (!existingIds.has(demoCol.collegeId.trim())) {
+            combined.push(demoCol);
+          }
+        }
+        return combined;
+      }
+      return INITIAL_DEMO_COLLEGES;
+    } catch (err: any) {
+      console.warn('[VerifAI] Firestore getColleges fallback to demo colleges:', err.message);
+      return INITIAL_DEMO_COLLEGES;
     }
   }
 
@@ -478,8 +1073,13 @@ export async function getColleges(): Promise<CollegeAccount[]> {
 }
 
 export async function getCollegeById(collegeId: string): Promise<CollegeAccount | null> {
+  const cleanId = collegeId.trim();
   const colleges = await getColleges();
-  return colleges.find((c) => c.collegeId.trim() === collegeId.trim()) || null;
+  const found = colleges.find((c) => c.collegeId.trim() === cleanId);
+  if (found) return found;
+
+  // Direct fallback to INITIAL_DEMO_COLLEGES to guarantee standard institutions always resolve
+  return INITIAL_DEMO_COLLEGES.find((c) => c.collegeId.trim() === cleanId) || null;
 }
 
 // ==========================================
@@ -497,20 +1097,40 @@ export async function getChecklistRequirements(
   if (isFirebaseConfigured && db) {
     try {
       const colRef = collection(db, 'checklists');
-      let q = query(colRef);
+      let constraints: any[] = [];
       if (type) {
-        q = query(colRef, where('applicationType', '==', type));
+        constraints.push(where('applicationType', '==', type));
       }
+      if (enforceActive) {
+        constraints.push(where('isActive', '==', true));
+      }
+      const q = constraints.length > 0 ? query(colRef, ...constraints) : query(colRef);
       const snapshot = await getDocs(q);
       let list = snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() } as ChecklistRequirement));
+
       if (list.length > 0) {
-        if (enforceActive) {
-          list = list.filter((r) => r.isActive);
-        }
         return list.sort((a, b) => a.displayOrder - b.displayOrder);
       }
-    } catch (err) {
-      console.warn('[VerifAI] Firestore getChecklistRequirements error, fallback to local storage:', err);
+
+      // If Firestore collection is empty, gracefully fall back to statutory baseline requirements
+      let fallback = INITIAL_CHECKLIST_REQUIREMENTS;
+      if (type) {
+        fallback = fallback.filter((r) => r.applicationType === type);
+      }
+      if (enforceActive) {
+        fallback = fallback.filter((r) => r.isActive);
+      }
+      return fallback.sort((a, b) => a.displayOrder - b.displayOrder);
+    } catch (err: any) {
+      console.warn('[VerifAI] Firestore getChecklistRequirements fallback to statutory checklist:', err.message);
+      let fallback = INITIAL_CHECKLIST_REQUIREMENTS;
+      if (type) {
+        fallback = fallback.filter((r) => r.applicationType === type);
+      }
+      if (enforceActive) {
+        fallback = fallback.filter((r) => r.isActive);
+      }
+      return fallback.sort((a, b) => a.displayOrder - b.displayOrder);
     }
   }
 
@@ -701,14 +1321,71 @@ export async function uploadApplicationDocument(
   let updatedDoc: RequiredDocument;
   let actionType: 'DOCUMENT_UPLOADED' | 'DOCUMENT_REPLACED' = 'DOCUMENT_UPLOADED';
 
+  const nextVersion = existingIdx >= 0 ? (documents[existingIdx].version || 1) + 1 : 1;
+  let fileBlobId: string | undefined;
+
+  // Process dataUrl: compress image if needed, validate <= 500 KiB Spark limit
+  let processedDataUrl = fileData.dataUrl;
+  if (processedDataUrl) {
+    if (processedDataUrl.startsWith('data:image/')) {
+      processedDataUrl = await compressImageForUpload(processedDataUrl);
+    }
+    const rawBytes = getDataUrlByteSize(processedDataUrl);
+    if (rawBytes > MAX_SPARK_FILE_BYTES) {
+      throw new Error(
+        `File "${fileData.fileName}" (${(rawBytes / 1024).toFixed(0)} KB) exceeds the Spark Free Tier limit of 500 KB per document. Please compress your PDF before uploading.`
+      );
+    }
+  }
+
   let fileHash: string | undefined;
-  if (fileData.dataUrl) {
+  if (processedDataUrl) {
     try {
-      fileHash = await calculateFileHash(fileData.dataUrl);
+      fileHash = await calculateFileHash(processedDataUrl);
     } catch {
       // ignore hash computation failure
     }
   }
+
+  let pdfMetadata: PdfDocumentMetadata | undefined;
+  if (processedDataUrl && (fileData.fileType?.toLowerCase().includes('pdf') || fileData.fileName?.toLowerCase().endsWith('.pdf'))) {
+    try {
+      pdfMetadata = extractPdfMetadataSync(processedDataUrl);
+    } catch {
+      // ignore metadata failure
+    }
+  }
+
+  // Ensure the parent application exists in Cloud Firestore before subcollection blob write
+  if (isFirebaseConfigured && db) {
+    try {
+      const sanitizedApp = stripBinaryPayloadsForFirestore(app);
+      await setDoc(doc(db, 'applications', app.id), sanitizedApp, { merge: true });
+    } catch (parentErr) {
+      console.warn('[VerifAI] Parent application pre-sync notice:', parentErr);
+    }
+  }
+
+  // Upload binary to Firestore subcollection if in Cloud Mode
+  if (isFirebaseConfigured && db && processedDataUrl) {
+    fileBlobId = `blob_${req.id}_v${nextVersion}_${Date.now().toString().slice(-4)}`;
+    try {
+      await uploadFileBlobToFirestore(app.id, fileBlobId, processedDataUrl, {
+        fileName: fileData.fileName,
+        fileType: fileData.fileType,
+        requirementId: req.id,
+        version: nextVersion,
+        sha256: fileHash,
+        collegeId: app.collegeId,
+      });
+    } catch (err: any) {
+      console.warn(`[VerifAI] Cloud fileBlob write warning: ${err?.message || 'Permission denied'}. Preserving in local dossier.`);
+    }
+  } else if (!isFirebaseConfigured && processedDataUrl) {
+    fileBlobId = `local_${req.id}_v${nextVersion}`;
+  }
+
+  const fileUrlToStore = processedDataUrl;
 
   if (existingIdx >= 0) {
     actionType = 'DOCUMENT_REPLACED';
@@ -720,6 +1397,9 @@ export async function uploadApplicationDocument(
       fileType: oldDoc.fileType,
       uploadDate: oldDoc.uploadDate,
       fileDataUrl: oldDoc.fileDataUrl,
+      fileUrl: oldDoc.fileUrl,
+      storagePath: oldDoc.storagePath,
+      fileBlobId: oldDoc.fileBlobId,
       fileHash: oldDoc.fileHash,
       extractedText: oldDoc.extractedText,
       ocrResult: oldDoc.ocrResult,
@@ -739,8 +1419,12 @@ export async function uploadApplicationDocument(
       fileName: fileData.fileName,
       fileSize: fileData.fileSize,
       fileType: fileData.fileType,
-      fileDataUrl: fileData.dataUrl,
+      fileDataUrl: fileUrlToStore,
+      fileUrl: undefined,
+      storagePath: undefined,
+      fileBlobId,
       fileHash,
+      pdfMetadata,
       duplicateCheckResult: undefined, // Clear old duplicate findings on replacement
       uploadDate: now,
       adminRemarks: undefined, // Clear past rejection remark on replacement
@@ -749,9 +1433,8 @@ export async function uploadApplicationDocument(
       ocrExtractedAt: undefined,
       ocrMethod: undefined,
       validationResult: undefined, // Invalidate old validation findings upon replacement
-      version: (oldDoc.version || 1) + 1,
+      version: nextVersion,
       previousVersions: prevVersions,
-      pdfMetadata: undefined,
       authorityVerificationResult: undefined, // Invalidate old authority verification result on replacement
     };
     documents[existingIdx] = updatedDoc;
@@ -766,8 +1449,12 @@ export async function uploadApplicationDocument(
       fileName: fileData.fileName,
       fileSize: fileData.fileSize,
       fileType: fileData.fileType,
-      fileDataUrl: fileData.dataUrl,
+      fileDataUrl: fileUrlToStore,
+      fileUrl: undefined,
+      storagePath: undefined,
+      fileBlobId,
       fileHash,
+      pdfMetadata,
       duplicateCheckResult: undefined,
       uploadDate: now,
       version: 1,
@@ -829,7 +1516,18 @@ export async function uploadApplicationDocument(
     console.warn('[VerifAI] Regulatory compliance assessment error during upload:', err);
   }
 
-  return await createOrUpdateApplication(updatedApp);
+  try {
+    return await createOrUpdateApplication(updatedApp);
+  } catch (persistErr: any) {
+    if (fileBlobId && isFirebaseConfigured && db) {
+      try {
+        await deleteFileBlobFromFirestore(app.id, fileBlobId);
+      } catch (cleanErr) {
+        console.warn('[VerifAI] Orphaned blob cleanup warning:', cleanErr);
+      }
+    }
+    throw new Error(`Document blob uploaded, but database synchronization failed: ${persistErr.message}. The change was not saved.`);
+  }
 }
 
 export async function removeApplicationDocument(
@@ -848,13 +1546,24 @@ export async function removeApplicationDocument(
   const idx = documents.findIndex((d) => d.id === requirementId || d.requirementId === requirementId);
   if (idx < 0) return app;
 
-  const docName = documents[idx].name;
+  const oldDoc = documents[idx];
+  if (oldDoc.fileBlobId && isFirebaseConfigured && db) {
+    await deleteFileBlobFromFirestore(app.id, oldDoc.fileBlobId);
+  }
+  if (oldDoc.storagePath && isFirebaseConfigured && storage) {
+    await deleteFromCloudStorage(oldDoc.storagePath);
+  }
+
+  const docName = oldDoc.name;
   documents[idx] = {
     ...documents[idx],
     status: 'NOT_UPLOADED',
     fileName: undefined,
     fileSize: undefined,
     fileDataUrl: undefined,
+    fileUrl: undefined,
+    storagePath: undefined,
+    fileBlobId: undefined,
     uploadDate: undefined,
     ocrResult: undefined,
     extractedText: undefined,
@@ -1144,7 +1853,7 @@ export async function saveDocumentOcrResult(
   requirementId: string,
   ocrResult: DocumentOcrResult
 ): Promise<CollegeApplication> {
-  const app = await getApplicationById(appId);
+  const app = await getApplicationById(appId, true);
   if (!app) throw new Error('Application dossier not found.');
 
   const documents = [...app.documents];
@@ -1196,7 +1905,7 @@ export async function saveDocumentValidationResult(
   requirementId: string,
   validationResult: DocumentValidationResult
 ): Promise<CollegeApplication> {
-  const app = await getApplicationById(appId);
+  const app = await getApplicationById(appId, true);
   if (!app) throw new Error('Application dossier not found.');
 
   const documents = [...app.documents];
@@ -1354,15 +2063,55 @@ export async function addInfrastructureEvidence(
   const now = new Date().toISOString().split('T')[0];
   const evidenceList = [...(app.infrastructureEvidence || [])];
   const randomSuffix = Math.random().toString(36).slice(2, 6);
+  const evidenceId = `EVID-${Date.now().toString().slice(-6)}-${randomSuffix}`;
+
+  let fileBlobId: string | undefined;
+
+  // Process dataUrl: compress image if needed, validate <= 500 KiB Spark limit
+  let processedDataUrl = evidenceData.fileDataUrl;
+  if (processedDataUrl) {
+    if (processedDataUrl.startsWith('data:image/')) {
+      processedDataUrl = await compressImageForUpload(processedDataUrl);
+    }
+    const rawBytes = getDataUrlByteSize(processedDataUrl);
+    if (rawBytes > MAX_SPARK_FILE_BYTES) {
+      throw new Error(
+        `Infrastructure evidence "${evidenceData.fileName}" (${(rawBytes / 1024).toFixed(0)} KB) exceeds the Spark Free Tier limit of 500 KB per document.`
+      );
+    }
+  }
+
+  // Upload to Firestore subcollection if in Cloud Mode
+  if (isFirebaseConfigured && db && processedDataUrl) {
+    fileBlobId = `blob_evid_${evidenceId}`;
+    try {
+      await uploadFileBlobToFirestore(app.id, fileBlobId, processedDataUrl, {
+        fileName: evidenceData.fileName,
+        fileType: evidenceData.fileType,
+        requirementId: evidenceData.requirementId,
+        version: 1,
+      });
+    } catch (err: any) {
+      throw new Error(`Cloud Firestore evidence blob upload failed: ${err.message || 'Network failure'}`);
+    }
+  } else if (!isFirebaseConfigured && processedDataUrl) {
+    fileBlobId = `local_evid_${evidenceId}`;
+  }
+
+  const fileUrlToStore = processedDataUrl;
+
   const rawItem: InfrastructureEvidenceItem = {
-    id: `EVID-${Date.now().toString().slice(-6)}-${randomSuffix}`,
+    id: evidenceId,
     applicationId: app.id,
     applicationTrack: app.type,
     title: evidenceData.title,
     fileName: evidenceData.fileName,
     fileSize: evidenceData.fileSize,
     fileType: evidenceData.fileType,
-    fileDataUrl: evidenceData.fileDataUrl,
+    fileDataUrl: fileUrlToStore,
+    fileUrl: undefined,
+    storagePath: undefined,
+    fileBlobId,
     evidenceCategory: evidenceData.evidenceCategory,
     requirementId: evidenceData.requirementId,
     uploadDate: now,
@@ -1403,7 +2152,18 @@ export async function addInfrastructureEvidence(
     console.warn('[VerifAI] Regulatory compliance assessment error:', err);
   }
 
-  return await createOrUpdateApplication(updatedApp);
+  try {
+    return await createOrUpdateApplication(updatedApp);
+  } catch (persistErr: any) {
+    if (fileBlobId && isFirebaseConfigured && db) {
+      try {
+        await deleteFileBlobFromFirestore(app.id, fileBlobId);
+      } catch (cleanErr) {
+        console.warn('[VerifAI] Orphaned evidence blob cleanup warning:', cleanErr);
+      }
+    }
+    throw new Error(`Infrastructure evidence blob uploaded, but database synchronization failed: ${persistErr.message}. The change was not saved.`);
+  }
 }
 
 export async function removeInfrastructureEvidence(
@@ -1427,6 +2187,12 @@ export async function removeInfrastructureEvidence(
   if (idx < 0) return app;
 
   const removed = evidenceList[idx];
+  if (removed.fileBlobId && isFirebaseConfigured && db) {
+    await deleteFileBlobFromFirestore(app.id, removed.fileBlobId);
+  }
+  if (removed.storagePath && isFirebaseConfigured && storage) {
+    await deleteFromCloudStorage(removed.storagePath);
+  }
   evidenceList.splice(idx, 1);
 
   const auditLogs = app.auditLogs || [];

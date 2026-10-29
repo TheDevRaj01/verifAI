@@ -32,9 +32,9 @@ export const ConfigNotice: React.FC = () => {
               </strong>
             )}{' '}
             {isFirebaseLive ? (
-              'Authentication & Cloud Firestore are running in live cloud mode.'
+              'Authentication, Cloud Firestore & Firebase Cloud Storage are running in live cloud sync mode.'
             ) : (
-              'Firebase API keys not configured in .env. Realtime local persistence (localStorage) is running with realistic AICTE test datasets.'
+              'Firebase API keys not configured in .env. Interactive Local Simulation Mode is active with isolated browser persistence.'
             )}
           </span>
         </div>

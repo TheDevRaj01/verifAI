@@ -1,0 +1,26 @@
+# ==============================================================================
+# VerifAI (SIH PS 26261) — Python Virtual Environment Requirements
+# Setup:
+#   python3 -m venv venv
+#   source venv/bin/activate    # On Windows: venv\Scripts\activate
+#   pip install -r requirements.txt
+# ==============================================================================
+
+# PDF Processing & Metadata Forensics
+pypdf>=4.3.0
+pdfplumber>=0.11.0
+pillow>=10.4.0
+pytesseract>=0.3.10
+
+# API & Microservice Framework (for optional Python backend/OCR endpoints)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+requests>=2.32.0
+python-dotenv>=1.0.1
+
+# Firebase Admin SDK (for backend data seeding, claims & Firestore management)
+firebase-admin>=6.5.0
+
+# Testing & Utilities
+pytest>=8.3.0

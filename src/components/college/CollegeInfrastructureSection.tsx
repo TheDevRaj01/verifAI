@@ -297,6 +297,14 @@ export const CollegeInfrastructureSection: React.FC<Props> = ({
           );
         }
 
+        // Spark Free Plan 500 KiB limit for non-image files (PDF blueprints)
+        const isImage = /\.(jpe?g|png|webp)$/i.test(file.name);
+        if (!isImage && file.size > 512000) {
+          throw new Error(
+            `File "${file.name}" (${(file.size / 1024).toFixed(0)} KB) exceeds the Spark Free Tier limit of 500 KB per document. Please compress your PDF before uploading.`
+          );
+        }
+
         // Read into Data URL for preview
         const dataUrl = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
